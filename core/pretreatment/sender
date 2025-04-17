@@ -1,0 +1,247 @@
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavdevice/avdevice.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/opt.h>
+#include <libavutil/imgutils.h>
+#include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
+}
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iostream>
+#include <thread>
+
+#pragma comment(lib, "ws2_32.lib")
+
+#define TARGET_IP   "127.0.0.1"
+#define TARGET_PORT 5002
+
+// 示例加密函数（替换为实际加密算法）
+void encrypt(uint8_t* data, int size) {
+    for (int i = 0; i < size; i++) {
+        data[i] ^= 0xAA; // 简单异或加密
+    }
+}
+
+AVCodecContext* create_audio_encoder() {
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    if (!codec) {
+        std::cerr << "AAC encoder not found" << std::endl;
+        return nullptr;
+    }
+
+    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+    codec_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    codec_ctx->bit_rate = 128000;
+    codec_ctx->sample_rate = 44100;
+    
+    AVChannelLayout layout = AV_CHANNEL_LAYOUT_STEREO;
+    av_channel_layout_copy(&codec_ctx->ch_layout, &layout);
+
+    if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+        avcodec_free_context(&codec_ctx);
+        return nullptr;
+    }
+    return codec_ctx;
+}
+
+AVCodecContext* create_video_encoder() {
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!codec) {
+        std::cerr << "H.264 encoder not found" << std::endl;
+        return nullptr;
+    }
+
+    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+    codec_ctx->width = 1280;
+    codec_ctx->height = 720;
+    codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    codec_ctx->time_base = {1, 30};
+    codec_ctx->bit_rate = 2500000;
+    av_opt_set(codec_ctx->priv_data, "preset", "slow", 0);
+
+    if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+        avcodec_free_context(&codec_ctx);
+        return nullptr;
+    }
+    return codec_ctx;
+}
+
+int main() {
+    avdevice_register_all();
+
+    // 初始化输入设备
+    AVFormatContext* input_ctx = nullptr;
+    const AVInputFormat* input_fmt = av_find_input_format("dshow");
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "video_size", "1280x720", 0);
+    av_dict_set(&options, "framerate", "30", 0);
+    av_dict_set(&options, "audio_sample_rate", "44100", 0);
+
+    //const char* device_name = "video=OBS Virtual Camera:audio=麦克风阵列 (Realtek(R) Audio)";
+    const char* device_name = "video=Integrated Camera:audio=外部麦克风 (Realtek(R) Audio)";
+    if (avformat_open_input(&input_ctx, device_name, input_fmt, &options) != 0) {
+        std::cerr << "Could not open input device" << std::endl;
+        av_dict_free(&options);
+        return -1;
+    }
+    av_dict_free(&options);
+
+    if (avformat_find_stream_info(input_ctx, nullptr) < 0) {
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+
+    // 查找流索引
+    int video_index = -1, audio_index = -1;
+    for (unsigned int i = 0; i < input_ctx->nb_streams; i++) {
+        AVCodecParameters* codecpar = input_ctx->streams[i]->codecpar;
+        if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_index = i;
+        } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            audio_index = i;
+        }
+    }
+
+    if (video_index == -1 || audio_index == -1) {
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+
+    // 初始化解码器
+    auto init_decoder = [](AVFormatContext* fmt_ctx, int index) -> AVCodecContext* {
+        AVCodecParameters* codecpar = fmt_ctx->streams[index]->codecpar;
+        const AVCodec* decoder = avcodec_find_decoder(codecpar->codec_id);
+        if (!decoder) return nullptr;
+
+        AVCodecContext* codec_ctx = avcodec_alloc_context3(decoder);
+        avcodec_parameters_to_context(codec_ctx, codecpar);
+        if (avcodec_open2(codec_ctx, decoder, nullptr) < 0) {
+            avcodec_free_context(&codec_ctx);
+            return nullptr;
+        }
+        return codec_ctx;
+    };
+
+    AVCodecContext* video_decoder = init_decoder(input_ctx, video_index);
+    AVCodecContext* audio_decoder = init_decoder(input_ctx, audio_index);
+    if (!video_decoder || !audio_decoder) {
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+
+    // 初始化编码器
+    AVCodecContext* video_encoder = create_video_encoder();
+    AVCodecContext* audio_encoder = create_audio_encoder();
+    if (!video_encoder || !audio_encoder) {
+        avformat_close_input(&input_ctx);
+        return -1;
+    }
+
+    // 初始化网络
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in target_addr{};
+    target_addr.sin_family = AF_INET;
+    target_addr.sin_port = htons(TARGET_PORT);
+    inet_pton(AF_INET, TARGET_IP, &target_addr.sin_addr);
+
+    // 分配资源
+    AVPacket* raw_pkt = av_packet_alloc();
+    AVFrame* decoded_frame = av_frame_alloc();
+    AVPacket* encoded_pkt = av_packet_alloc();
+
+    // 视频转换上下文（如果像素格式不匹配）
+    SwsContext* sws_ctx = sws_getContext(
+        video_decoder->width, video_decoder->height, video_decoder->pix_fmt,
+        video_encoder->width, video_encoder->height, video_encoder->pix_fmt,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+
+    // 音频重采样上下文
+    SwrContext* swr_ctx = swr_alloc();
+    av_opt_set_chlayout(swr_ctx, "in_chlayout", &audio_decoder->ch_layout, 0);
+    av_opt_set_int(swr_ctx, "in_sample_rate", audio_decoder->sample_rate, 0);
+    av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt", audio_decoder->sample_fmt, 0);
+    av_opt_set_chlayout(swr_ctx, "out_chlayout", &audio_encoder->ch_layout, 0);
+    av_opt_set_int(swr_ctx, "out_sample_rate", audio_encoder->sample_rate, 0);
+    av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", audio_encoder->sample_fmt, 0);
+    swr_init(swr_ctx);
+
+    while (av_read_frame(input_ctx, raw_pkt) >= 0) {
+        if (raw_pkt->stream_index == video_index) {
+            // 视频解码
+            if (avcodec_send_packet(video_decoder, raw_pkt) == 0) {
+                while (avcodec_receive_frame(video_decoder, decoded_frame) == 0) {
+                    // 格式转换
+                    AVFrame* converted_frame = av_frame_alloc();
+                    converted_frame->format = video_encoder->pix_fmt;
+                    converted_frame->width = video_encoder->width;
+                    converted_frame->height = video_encoder->height;
+                    av_frame_get_buffer(converted_frame, 0);
+                    
+                    sws_scale(sws_ctx, decoded_frame->data, decoded_frame->linesize,
+                              0, decoded_frame->height, 
+                              converted_frame->data, converted_frame->linesize);
+
+                    // 编码
+                    if (avcodec_send_frame(video_encoder, converted_frame) == 0) {
+                        while (avcodec_receive_packet(video_encoder, encoded_pkt) == 0) {
+                            encrypt(encoded_pkt->data, encoded_pkt->size);
+                            sendto(sock, (char*)encoded_pkt->data, encoded_pkt->size, 0,
+                                  (sockaddr*)&target_addr, sizeof(target_addr));
+                            av_packet_unref(encoded_pkt);
+                        }
+                    }
+                    av_frame_free(&converted_frame);
+                }
+            }
+        } 
+        else if (raw_pkt->stream_index == audio_index) {
+            // 音频解码
+            if (avcodec_send_packet(audio_decoder, raw_pkt) == 0) {
+                while (avcodec_receive_frame(audio_decoder, decoded_frame) == 0) {
+                    // 重采样
+                    AVFrame* resampled_frame = av_frame_alloc();
+                    resampled_frame->sample_rate = audio_encoder->sample_rate;
+                    resampled_frame->ch_layout = audio_encoder->ch_layout;
+                    resampled_frame->format = audio_encoder->sample_fmt;
+                    resampled_frame->nb_samples = audio_encoder->frame_size;
+                    av_frame_get_buffer(resampled_frame, 0);
+
+                    swr_convert_frame(swr_ctx, resampled_frame, decoded_frame);
+
+                    // 编码
+                    if (avcodec_send_frame(audio_encoder, resampled_frame) == 0) {
+                        while (avcodec_receive_packet(audio_encoder, encoded_pkt) == 0) {
+                            encrypt(encoded_pkt->data, encoded_pkt->size);
+                            sendto(sock, (char*)encoded_pkt->data, encoded_pkt->size, 0,
+                                  (sockaddr*)&target_addr, sizeof(target_addr));
+                            av_packet_unref(encoded_pkt);
+                        }
+                    }
+                    av_frame_free(&resampled_frame);
+                }
+            }
+        }
+        av_packet_unref(raw_pkt);
+    }
+
+    // 清理资源
+    sws_freeContext(sws_ctx);
+    swr_free(&swr_ctx);
+    av_packet_free(&raw_pkt);
+    av_packet_free(&encoded_pkt);
+    av_frame_free(&decoded_frame);
+    avcodec_free_context(&video_decoder);
+    avcodec_free_context(&audio_decoder);
+    avcodec_free_context(&video_encoder);
+    avcodec_free_context(&audio_encoder);
+    avformat_close_input(&input_ctx);
+    closesocket(sock);
+    WSACleanup();
+    
+    return 0;
+}
